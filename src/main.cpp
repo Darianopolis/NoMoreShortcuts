@@ -2,6 +2,10 @@
 #include <vector>
 #include <format>
 #include <sstream>
+#include <fstream>
+#include <algorithm>
+#include <execution>
+#include <future>
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -27,29 +31,37 @@ struct Indexer
     size_t count = 0;
 
     template<class Fn>
-    void Index(Fn&& fn)
+    static void Index(Fn&& fn)
     {
         wchar_t driveNames[1024];
         GetLogicalDriveStringsW(1023, driveNames);
 
-        path[0] = L'\\';
-        path[1] = L'\\';
-        path[2] = L'?';
-        path[3] = L'\\';
-
+        std::vector<wchar_t*> drives;
         for (wchar_t* drive = driveNames; *drive; drive += wcslen(drive) + 1)
+            drives.push_back(drive);
+
+#pragma omp parallel for
+        for (uint32_t i = 0; i < drives.size(); ++i)
         {
+            auto drive = drives[i];
+
             std::wcout << L"Drive [" << drive << L"]\n";
 
             // Remove trailing '\' and convert to uppercase
             drive[wcslen(drive) - 1] = L'\0';
             drive = _wcsupr(drive);
 
-            wcscpy(path + 4, drive);
+            Indexer indexer;
+            indexer.path[0] = L'\\';
+            indexer.path[1] = L'\\';
+            indexer.path[2] = L'?';
+            indexer.path[3] = L'\\';
 
-            std::wcout << L"  searching [" << path << L"]\n";
+            wcscpy(indexer.path + 4, drive);
 
-            Search(wcslen(path), 0, std::forward<Fn>(fn));
+            std::wcout << L"  searching [" << indexer.path << L"]\n";
+
+            indexer.Search(wcslen(indexer.path), 0, std::forward<Fn>(fn));
         }
     }
 
@@ -102,7 +114,7 @@ struct Indexer
 
             if (++count % 10'000 == 0)
             {
-                std::cout << "Files = " << count << ", path = " << buffer << '\n';
+                std::cout << std::format("Files = {}, path = {}\n", count, buffer);
             }
 
             fn(buffer, depth + 1);
@@ -125,6 +137,42 @@ struct Indexer
     }
 };
 
+bool ContainsCI(std::string_view value, std::string_view needle)
+{
+    auto comp = [&](uint32_t index, char c) {
+        return std::tolower(value[index++]) == c;
+    };
+
+    const size_t nSize = needle.size();
+    const size_t vSize = value.size();
+
+    if (nSize > vSize)
+        return false;
+
+    if (vSize == 0)
+        return true;
+
+    const char first = needle[0];
+    const size_t max = vSize - nSize;
+
+    for (size_t i = 0; i <= max; ++i) {
+        if (!comp(i, first)) {
+            while (++i <= max && !comp(i, first));
+        }
+
+        if (i <= max) {
+            size_t j = i + 1;
+            const size_t trueEnd = j + nSize - 1;
+            const size_t end = (vSize > trueEnd) ? trueEnd : vSize;
+            for (size_t k = 1; j < end && comp(j, needle[k]); ++j, ++k);
+            if (j == trueEnd)
+                return true;
+        }
+    }
+
+    return false;
+}
+
 int main()
 {
     glfwInit();
@@ -143,16 +191,6 @@ int main()
         image.pixels = stbi_load("IconVector.png", &image.width, &image.height, &channels, STBI_rgb_alpha);
         glfwSetWindowIcon(window, 1, &image);
         stbi_image_free(image.pixels);
-    }
-
-    {
-        // Center window
-
-        int count = 0;
-        auto monitor = glfwGetVideoMode(glfwGetMonitors(&count)[0]);
-        int w, h;
-        glfwGetWindowSize(window, &w, &h);
-        glfwSetWindowPos(window, (monitor->width - w) / 2, (monitor->height - h) / 2);
     }
 
     ImGui::CreateContext();
@@ -177,10 +215,6 @@ int main()
     };
 
     std::vector<File> files;
-    for (uint32_t i = 0; i < 4'000'000; ++i)
-    {
-        files.push_back({ std::format("C:/Files/blah/file{}.txt", i), 3, 0 });
-    }
 
     std::vector<uint32_t> filtered;
     std::atomic_uint32_t filteredCount;
@@ -193,6 +227,7 @@ int main()
 
         while (std::getline(iss, entry, ' '))
         {
+            std::transform(entry.begin(), entry.end(), entry.begin(), [](char c) { return std::tolower(c); });
             if (entry.size())
                 keywords.push_back(entry);
         }
@@ -202,6 +237,8 @@ int main()
         using namespace std::chrono;
         auto start = steady_clock::now();
 
+        filtered.resize(files.size());
+
 #pragma omp parallel for
         for (uint32_t i = 0; i < files.size(); ++i)
         {
@@ -210,7 +247,7 @@ int main()
             bool show = true;
             for (auto& keyword : keywords)
             {
-                if (!file.path.contains(keyword))
+                if (!ContainsCI(file.path, keyword))
                 {
                     show = false;
                     break;
@@ -221,16 +258,80 @@ int main()
                 filtered[filteredCount++] = i;
         }
 
+        std::sort(std::execution::par_unseq, filtered.begin(), filtered.begin() + filteredCount, [](auto l, auto r) {
+            return l <= r;
+        });
+
         auto end = steady_clock::now();
 
         std::cout << "Filtered results: " << filteredCount << " in " << duration_cast<milliseconds>(end - start).count() << " ms\n";
     };
 
-    filter("");
+    auto save = [&] {
+        std::ofstream out("index.txt", std::ios::binary);
+        for (auto& file : files)
+        {
+            out << file.uses;
+            out << ' ';
+            out << file.depth;
+            out << ' ';
+            out << file.path;
+            out << '\n';
+        }
+    };
+
+    auto load = [&] {
+        std::ifstream fin("index.txt", std::ios::binary | std::ios::ate);
+        std::string contents;
+        contents.resize(fin.tellg());
+        fin.seekg(0);
+        fin.read(contents.data(), contents.size());
+        fin.close();
+
+        std::cout << "Loaded contents\n";
+
+        std::istringstream in(contents);
+
+        files.clear();
+
+        while (!in.eof())
+        {
+            uint32_t uses, depth;
+            in >> uses;
+            in >> depth;
+            std::string path;
+            std::getline(in, path, '\n');
+
+            if (files.size() % 10'000 == 0)
+                std::cout << "Loaded " << files.size() << '\n';
+
+            if (path.size())
+                files.push_back({ std::move(path), depth, uses });
+        }
+
+        std::cout << "Loaded done\n";
+    };
 
     auto sort = [&] {
+        std::sort(
+            std::execution::par_unseq,
+            files.begin(), files.end(),
+            [](const File& l, const File& r) {
+                if (l.uses != r.uses)
+                    return l.uses >= r.uses;
 
+                if (l.depth != r.depth)
+                    return l.depth <= r.depth;
+
+                if (l.path.size() != r.path.size())
+                    return l.path.size() <= r.path.size();
+
+                return std::lexicographical_compare(l.path.begin(), l.path.end(), r.path.begin(), r.path.end());
+            });
     };
+
+    load();
+    filter("");
 
     bool running = true;
     bool focusInput = true;
@@ -282,11 +383,30 @@ int main()
 
                     if (ImGui::MenuItem("Index", nullptr, &selected))
                     {
-                        Indexer indexer;
                         files.clear();
-                        indexer.Index([&](const char* path, uint32_t depth) {
-                            files.emplace_back(path, depth, 0);
+                        std::mutex mutex;
+                        Indexer::Index([&](const char* path, uint32_t depth) {
+                            std::string str = path;
+                            std::scoped_lock lock{mutex};
+                            files.emplace_back(std::move(str), depth, 0);
                         });
+                        filter(query);
+                    }
+
+                    if (ImGui::MenuItem("Save", nullptr, &selected))
+                    {
+                        save();
+                    }
+
+                    if (ImGui::MenuItem("Load", nullptr, &selected))
+                    {
+                        load();
+                        filter(query);
+                    }
+
+                    if (ImGui::MenuItem("Sort", nullptr, &selected))
+                    {
+                        sort();
                         filter(query);
                     }
 
@@ -306,8 +426,6 @@ int main()
 
             ImGui::End();
         }
-
-        ImGui::ShowDemoWindow();
 
         {
             ImGui::Begin("Search");
@@ -355,6 +473,19 @@ int main()
         while (GetMessage(&msg, glfwGetWin32Window(window), 0, 0) && msg.message != WM_HOTKEY);
 
         glfwShowWindow(window);
+
+        {
+            // Center window
+
+            glfwSetWindowSize(window, 1920, 1200);
+
+            int count = 0;
+            auto monitor = glfwGetVideoMode(glfwGetMonitors(&count)[0]);
+            int w, h;
+            glfwGetWindowSize(window, &w, &h);
+            glfwSetWindowPos(window, (monitor->width - w) / 2, (monitor->height - h) / 2);
+        }
+
         glfwSetWindowShouldClose(window, GLFW_FALSE);
 
         focusInput = true;
