@@ -1,6 +1,7 @@
 #include <iostream>
 #include <vector>
 #include <format>
+#include <sstream>
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -62,15 +63,61 @@ int main()
     ImGui::GetIO().Fonts->AddFontFromFileTTF("CONSOLA.TTF", 20, &fontConfig);
     ImGui_ImplOpenGL3_CreateFontsTexture();
 
-    char query[512] = {};
-
     std::vector<std::string> files;
     for (uint32_t i = 0; i < 4'000'000; ++i)
     {
         files.push_back(std::format("C:/Files/blah/file{}.txt", i));
     }
 
+    std::vector<uint32_t> filtered;
+    std::atomic_uint32_t filteredCount;
+    filtered.resize(files.size());
+
+    auto filter = [&](std::string query) {
+        std::istringstream iss(query);
+        std::string entry;
+        std::vector<std::string> keywords;
+
+        while (std::getline(iss, entry, ' '))
+        {
+            if (entry.size())
+                keywords.push_back(entry);
+        }
+
+        filteredCount = 0;
+
+        using namespace std::chrono;
+        auto start = steady_clock::now();
+
+#pragma omp parallel for
+        for (uint32_t i = 0; i < files.size(); ++i)
+        {
+            std::string& file = files[i];
+
+            bool show = true;
+            for (auto& keyword : keywords)
+            {
+                if (!file.contains(keyword))
+                {
+                    show = false;
+                    break;
+                }
+            }
+
+            if (show)
+                filtered[filteredCount++] = i;
+        }
+
+        auto end = steady_clock::now();
+
+        std::cout << "Filtered results: " << filteredCount << " in " << duration_cast<milliseconds>(end - start).count() << " ms\n";
+    };
+
+    filter("");
+
     bool running = true;
+    bool focusInput = true;
+    char query[512] = {};
 
     auto draw = [&] {
         ImGui_ImplOpenGL3_NewFrame();
@@ -112,10 +159,10 @@ int main()
 
             if (ImGui::BeginMenuBar())
             {
-                if (ImGui::BeginMenu("No More Shortcuts"))
+                if (ImGui::BeginMenu("File"))
                 {
                     bool selected = false;
-                    if (ImGui::MenuItem("Exit", nullptr, &selected))
+                    if (ImGui::MenuItem("Shutdown", nullptr, &selected))
                     {
                         glfwSetWindowShouldClose(window, GLFW_TRUE);
                         running = false;
@@ -135,21 +182,29 @@ int main()
         {
             ImGui::Begin("Search");
 
-            if (ImGui::InputText("##", query, 511))
+            if (focusInput)
             {
-                std::cout << "Processing query: " << query << '\n';
+                ImGui::SetKeyboardFocusHere();
+                focusInput = false;
             }
 
-            ImGui::BeginChild("##");
+            if (ImGui::InputText("##InputSearchField", query, 511))
+            {
+                std::cout << "Processing query: " << query << '\n';
+
+                filter(std::string(query));
+            }
+
+            ImGui::BeginChild("##InputSearchResults");
 
             ImGuiListClipper clipper;
-            clipper.Begin(uint32_t(files.size()));
+            clipper.Begin(uint32_t(filteredCount));
             while (clipper.Step())
             {
                 for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i)
                 {
                     bool selected = false;
-                    ImGui::Selectable(std::format(" - {}", files[i]).c_str(), selected);
+                    ImGui::Selectable(std::format(" - {}", files[filtered[i]]).c_str(), selected);
                 }
             }
 
@@ -169,9 +224,10 @@ int main()
         MSG msg { 0 };
         while (GetMessage(&msg, glfwGetWin32Window(window), 0, 0) && msg.message != WM_HOTKEY);
 
-        std::cout << "Hotkey pressed! Showing...\n";
         glfwShowWindow(window);
         glfwSetWindowShouldClose(window, GLFW_FALSE);
+
+        focusInput = true;
 
         while (!glfwWindowShouldClose(window))
         {
