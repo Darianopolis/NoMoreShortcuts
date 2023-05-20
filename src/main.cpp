@@ -6,10 +6,14 @@
 #include <algorithm>
 #include <execution>
 #include <future>
+#include <filesystem>
+#include <regex>
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <Windows.h>
+#include <shellapi.h>
+#include <combaseapi.h>
 
 #define GLFW_EXPOSE_NATIVE_WIN32
 #include <GLFW/glfw3.h>
@@ -139,7 +143,7 @@ struct Indexer
 
 bool ContainsCI(std::string_view value, std::string_view needle)
 {
-    auto comp = [&](uint32_t index, char c) {
+    auto comp = [&](size_t index, char c) {
         return std::tolower(value[index++]) == c;
     };
 
@@ -175,6 +179,8 @@ bool ContainsCI(std::string_view value, std::string_view needle)
 
 int main()
 {
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+
     glfwInit();
     glfwWindowHint(GLFW_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_VERSION_MINOR, 3);
@@ -211,7 +217,7 @@ int main()
     {
         std::string path;
         uint32_t depth;
-        uint32_t uses;
+        uint32_t uses = 0;
     };
 
     std::vector<File> files;
@@ -227,7 +233,7 @@ int main()
 
         while (std::getline(iss, entry, ' '))
         {
-            std::transform(entry.begin(), entry.end(), entry.begin(), [](char c) { return std::tolower(c); });
+            std::transform(entry.begin(), entry.end(), entry.begin(), [](char c) { return char(std::tolower(c)); });
             if (entry.size())
                 keywords.push_back(entry);
         }
@@ -300,6 +306,7 @@ int main()
             in >> uses;
             in >> depth;
             std::string path;
+            in.get();
             std::getline(in, path, '\n');
 
             if (files.size() % 10'000 == 0)
@@ -336,6 +343,49 @@ int main()
     bool running = true;
     bool focusInput = true;
     char query[512] = {};
+    int selected = -1;
+
+    enum class Operation {
+        Open,
+        RunAs,
+        Explore,
+        ShowInExplorer,
+        CopyToClipboard,
+    };
+
+    auto open = [&](File& file, Operation op, bool incrementUsage = false) {
+        switch (op)
+        {
+        break;case Operation::Open:
+            ShellExecuteA(nullptr, "open", file.path.c_str(), nullptr, nullptr, SW_SHOW);
+        break;case Operation::RunAs:
+            ShellExecuteA(nullptr, "runas", file.path.c_str(), nullptr, nullptr, SW_SHOW);
+        break;case Operation::Explore:
+            ShellExecuteA(nullptr, "explore", file.path.c_str(), nullptr, nullptr, SW_SHOW);
+        break;case Operation::ShowInExplorer:
+            std::system(std::format("explorer /select,\"{}\"", file.path).c_str());
+        break;case Operation::CopyToClipboard:
+            {
+                OpenClipboard(glfwGetWin32Window(window));
+                EmptyClipboard();
+                auto contentHandle = GlobalAlloc(GMEM_MOVEABLE, file.path.size() + 1);
+                auto contents = GlobalLock(contentHandle);
+                memcpy(contents, file.path.c_str(), file.path.size() + 1);
+                for (auto c = (char*)contents; *c; ++c)
+                    *c = *c == '\\' ? '/' : *c;
+                GlobalUnlock(contentHandle);
+                SetClipboardData(CF_TEXT, contentHandle);
+                CloseClipboard();
+            }
+        }
+
+        if (incrementUsage)
+        {
+            file.uses++;
+            sort();
+            filter(query);
+        }
+    };
 
     auto draw = [&] {
         ImGui_ImplOpenGL3_NewFrame();
@@ -436,6 +486,9 @@ int main()
                 focusInput = false;
             }
 
+            if (glfwGetKey(window, GLFW_KEY_G))
+                ImGui::SetKeyboardFocusHere();
+
             if (ImGui::InputText("##InputSearchField", query, 511))
             {
                 std::cout << "Processing query: " << query << '\n';
@@ -451,8 +504,57 @@ int main()
             {
                 for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i)
                 {
-                    bool selected = false;
-                    ImGui::Selectable(std::format(" - {}", files[filtered[i]].path).c_str(), selected);
+                    int index = filtered[i];
+                    auto& file = files[index];
+
+                    ImGui::Selectable(file.path.c_str(), selected == index, ImGuiSelectableFlags_AllowDoubleClick);
+
+                    if (ImGui::IsItemHovered())
+                    {
+                        if (selected != index)
+                        {
+                            selected = index;
+                            ImGui::SetKeyboardFocusHere(-1);
+                        }
+
+                        if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || (ImGui::IsMouseDoubleClicked(GLFW_MOUSE_BUTTON_1)))
+                        {
+                            open(file, Operation::Open, true);
+                        }
+
+                        if (ImGui::IsKeyPressed(ImGuiKey_C, false) && ImGui::IsKeyDown(ImGuiKey_LeftCtrl))
+                            open(file, Operation::CopyToClipboard);
+
+                        if (ImGui::IsItemHovered(ImGuiHoveredFlags_NoNavOverride))
+                            ImGui::SetNextWindowPos(ImGui::GetMousePos());
+                    }
+
+                    if (selected == index && ImGui::BeginPopupContextWindow("OpenPopupID",
+                        ImGuiPopupFlags_MouseButtonRight))
+                    {
+                        if (ImGui::MenuItem("Open"))
+                            open(file, Operation::Open, true);
+
+                        ImGui::Separator();
+
+                        if (ImGui::MenuItem("Explore"))
+                            open(file, Operation::Explore, true);
+
+                        if (ImGui::MenuItem("Show in Explorer"))
+                            open(file, Operation::ShowInExplorer, true);
+
+                        ImGui::Separator();
+
+                        if (ImGui::MenuItem("Copy Path"))
+                            open(file, Operation::CopyToClipboard);
+
+                        ImGui::Separator();
+
+                        if (ImGui::MenuItem("Run as Administrator"))
+                            open(file, Operation::RunAs, true);
+
+                        ImGui::EndPopup();
+                    }
                 }
             }
 
@@ -494,6 +596,7 @@ int main()
         {
             glfwWaitEvents();
 
+            draw();
             draw();
             draw();
 
