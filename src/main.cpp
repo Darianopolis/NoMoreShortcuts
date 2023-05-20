@@ -19,6 +19,112 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
+struct Indexer
+{
+    wchar_t path[32767];
+    char buffer[32767];
+    WIN32_FIND_DATA result;
+    size_t count = 0;
+
+    template<class Fn>
+    void Index(Fn&& fn)
+    {
+        wchar_t driveNames[1024];
+        GetLogicalDriveStringsW(1023, driveNames);
+
+        path[0] = L'\\';
+        path[1] = L'\\';
+        path[2] = L'?';
+        path[3] = L'\\';
+
+        for (wchar_t* drive = driveNames; *drive; drive += wcslen(drive) + 1)
+        {
+            std::wcout << L"Drive [" << drive << L"]\n";
+
+            // Remove trailing '\' and convert to uppercase
+            drive[wcslen(drive) - 1] = L'\0';
+            drive = _wcsupr(drive);
+
+            wcscpy(path + 4, drive);
+
+            std::wcout << L"  searching [" << path << L"]\n";
+
+            Search(wcslen(path), 0, std::forward<Fn>(fn));
+        }
+    }
+
+    template<class Fn>
+    void Search(size_t offset, uint32_t depth, Fn&& fn)
+    {
+        path[offset] = L'\\';
+        path[offset + 1] = L'*';
+        path[offset + 2] = L'\0';
+
+        HANDLE findHandle = FindFirstFileEx(
+            path,
+            FindExInfoBasic,
+            &result,
+            FindExSearchNameMatch,
+            nullptr,
+            FIND_FIRST_EX_LARGE_FETCH);
+
+        if (findHandle == INVALID_HANDLE_VALUE)
+            return;
+
+        do
+        {
+            size_t len = wcslen(result.cFileName);
+
+            // Ignore empty, current "." and parent ".." directories
+            if (len == 0 || (result.cFileName[0] == '.' && (len == 1 || (len == 2) && result.cFileName[1] == '.')))
+                continue;
+
+            wcscpy(path + offset + 1, result.cFileName);
+
+            BOOL usedDefault = false;
+            size_t utf8Len = WideCharToMultiByte(
+                CP_UTF8,
+                0,
+                path + 4,
+                int(offset - 3 + len),
+                buffer,
+                sizeof(buffer) - 1,
+                nullptr,
+                &usedDefault);
+
+            buffer[utf8Len] = '\0';
+
+            if (utf8Len == 0)
+            {
+                std::wcout << "Failed to convert " << result.cFileName << L"\n";
+                continue;
+            }
+
+            if (++count % 10'000 == 0)
+            {
+                std::cout << "Files = " << count << ", path = " << buffer << '\n';
+            }
+
+            fn(buffer, depth + 1);
+
+            if (result.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            {
+                memcpy(&path[offset + 1], result.cFileName, 2 * len);
+                Search(offset + len + 1, depth + 1, std::forward<Fn>(fn));
+            }
+            else
+            {
+                // Clear path extension from conversion operation
+                path[offset + 1] = L'*';
+                path[offset + 2] = L'\0';
+            }
+        }
+        while (FindNextFile(findHandle, &result));
+
+        FindClose(findHandle);
+    }
+};
+
 int main()
 {
     glfwInit();
@@ -63,10 +169,17 @@ int main()
     ImGui::GetIO().Fonts->AddFontFromFileTTF("CONSOLA.TTF", 20, &fontConfig);
     ImGui_ImplOpenGL3_CreateFontsTexture();
 
-    std::vector<std::string> files;
+    struct File
+    {
+        std::string path;
+        uint32_t depth;
+        uint32_t uses;
+    };
+
+    std::vector<File> files;
     for (uint32_t i = 0; i < 4'000'000; ++i)
     {
-        files.push_back(std::format("C:/Files/blah/file{}.txt", i));
+        files.push_back({ std::format("C:/Files/blah/file{}.txt", i), 3, 0 });
     }
 
     std::vector<uint32_t> filtered;
@@ -92,12 +205,12 @@ int main()
 #pragma omp parallel for
         for (uint32_t i = 0; i < files.size(); ++i)
         {
-            std::string& file = files[i];
+            auto& file = files[i];
 
             bool show = true;
             for (auto& keyword : keywords)
             {
-                if (!file.contains(keyword))
+                if (!file.path.contains(keyword))
                 {
                     show = false;
                     break;
@@ -114,6 +227,10 @@ int main()
     };
 
     filter("");
+
+    auto sort = [&] {
+
+    };
 
     bool running = true;
     bool focusInput = true;
@@ -162,6 +279,19 @@ int main()
                 if (ImGui::BeginMenu("File"))
                 {
                     bool selected = false;
+
+                    if (ImGui::MenuItem("Index", nullptr, &selected))
+                    {
+                        Indexer indexer;
+                        files.clear();
+                        indexer.Index([&](const char* path, uint32_t depth) {
+                            files.emplace_back(path, depth, 0);
+                        });
+                        filter(query);
+                    }
+
+                    ImGui::Separator();
+
                     if (ImGui::MenuItem("Shutdown", nullptr, &selected))
                     {
                         glfwSetWindowShouldClose(window, GLFW_TRUE);
@@ -204,7 +334,7 @@ int main()
                 for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i)
                 {
                     bool selected = false;
-                    ImGui::Selectable(std::format(" - {}", files[filtered[i]]).c_str(), selected);
+                    ImGui::Selectable(std::format(" - {}", files[filtered[i]].path).c_str(), selected);
                 }
             }
 
@@ -242,8 +372,8 @@ int main()
 
             glfwSwapBuffers(window);
 
-            if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
-                glfwSetWindowShouldClose(window, GLFW_TRUE);
+            // if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
+            //     glfwSetWindowShouldClose(window, GLFW_TRUE);
         }
 
         glfwHideWindow(window);
