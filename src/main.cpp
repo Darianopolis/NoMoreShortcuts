@@ -514,7 +514,8 @@ int main()
                         if (selected != index)
                         {
                             selected = index;
-                            ImGui::SetKeyboardFocusHere(-1);
+                            if (ImGui::IsWindowFocused())
+                                ImGui::SetKeyboardFocusHere(-1);
                         }
 
                         if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || (ImGui::IsMouseDoubleClicked(GLFW_MOUSE_BUTTON_1)))
